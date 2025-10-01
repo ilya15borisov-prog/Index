@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Диктофон с Whisper (без Storage)</title>
+    <!-- Firebase SDK (только Auth, без Storage) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+        #loginForm { display: block; }
+        #app { display: none; }
+        button { margin: 10px; padding: 10px 20px; font-size: 16px; }
+        #recordBtn { background: red; color: white; }
+        #pauseBtn { background: orange; color: white; }
+        #stopBtn { background: green; color: white; }
+        #recordingAnimation { display: none; animation: pulse 1s infinite; }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+        textarea { width: 80%; height: 200px; margin: 20px auto; display: block; }
+        #loading { display: none; color: blue; }
+        #error { color: red; }
+        input { margin: 10px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <div id="loginForm">
+        <h2>Вход в систему</h2>
+        <input type="email" id="email" placeholder="Email" required>
+        <input type="password" id="password" placeholder="Пароль" required>
+        <button id="loginBtn">Войти</button>
+        <button id="registerBtn">Регистрация</button>
+        <div id="authError"></div>
+    </div>
+
+    <div id="app">
+        <h1>Диктофон с транскрибацией (без сохранения)</h1>
+        <div id="recordingAnimation">⏺️ Запись...</div>
+        <button id="recordBtn">Запись</button>
+        <button id="pauseBtn" disabled>Пауза</button>
+        <button id="stopBtn" disabled>Стоп</button>
+        <button id="resetBtn">Вернуть оригинал</button>
+        <button id="exportBtn">Экспорт текста</button>
+        <button id="logoutBtn">Выход</button>
+        <div id="loading">Обработка...</div>
+        <div id="error"></div>
+        <textarea id="transcription" placeholder="Здесь появится транскрибация..."></textarea>
+    </div>
+
+    <script>
+        // Настройки (замени на свои!)
+        const openaiApiKey = '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'; // НЕ ХРАНИ В КЛИЕНТЕ!
+        const firebaseConfig = {
+            apiKey: "AIzaSyD8rnM4-7qqtGXfgmrYmRfAmQ1VE6hCQQw",
+            authDomain: "index-38eds.firebaseapp.com",
+            projectId: "index-38eds",
+            // storageBucket не нужен
+            messagingSenderId: "874629961297",
+            appId: "1:874629961297:web:16614cf7411138e2868a70"
+        };
+
+        // Инициализация Firebase (только Auth)
+        firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+
+        // Переменные
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let isPaused = false;
+        let originalText = '';
+        let user = null; // Текущий пользователь
+
+        // Элементы DOM
+        const loginForm = document.getElementById('loginForm');
+        const app = document.getElementById('app');
+        const emailInput = document.getElementById('email');
+        const passwordInput = document.getElementById('password');
+        const loginBtn = document.getElementById('loginBtn');
+        const registerBtn = document.getElementById('registerBtn');
+        const authError = document.getElementById('authError');
+        const recordBtn = document.getElementById('recordBtn');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const transcription = document.getElementById('transcription');
+        const loading = document.getElementById('loading');
+        const error = document.getElementById('error');
+        const animation = document.getElementById('recordingAnimation');
+
+        // Проверка состояния аутентификации
+        auth.onAuthStateChanged(currentUser => {
+            if (currentUser) {
+                user = currentUser;
+                loginForm.style.display = 'none';
+                app.style.display = 'block';
+            } else {
+                user = null;
+                loginForm.style.display = 'block';
+                app.style.display = 'none';
+            }
+        });
+
+        // Логин
+        loginBtn.addEventListener('click', async () => {
+            const email = emailInput.value;
+            const password = passwordInput.value;
+            try {
+                await auth.signInWithEmailAndPassword(email, password);
+                authError.textContent = '';
+            } catch (err) {
+                authError.textContent = 'Ошибка входа: ' + err.message;
+            }
+        });
+
+        // Регистрация
+        registerBtn.addEventListener('click', async () => {
+            const email = emailInput.value;
+            const password = passwordInput.value;
+            try {
+                await auth.createUserWithEmailAndPassword(email, password);
+                authError.textContent = '';
+            } catch (err) {
+                authError.textContent = 'Ошибка регистрации: ' + err.message;
+            }
+        });
+
+        // Выход
+        logoutBtn.addEventListener('click', () => {
+            auth.signOut();
+        });
+
+        // Функция для показа ошибок
+        function showError(message) {
+            error.textContent = message;
+            loading.style.display = 'none';
+        }
+
+        // Запуск записи (только если пользователь авторизован)
+        recordBtn.addEventListener('click', async () => {
+            if (!user) {
+                showError('Необходимо войти в систему!');
+                return;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    await processAudio(audioBlob);
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                isPaused = false;
+                recordBtn.disabled = true;
+                pauseBtn.disabled = false;
+                stopBtn.disabled = false;
+                animation.style.display = 'block';
+                error.textContent = '';
+            } catch (err) {
+                showError('Ошибка доступа к микрофону: ' + err.message);
+            }
+        });
+
+        // Пауза/возобновление
+        pauseBtn.addEventListener('click', () => {
+            if (isPaused) {
+                mediaRecorder.resume();
+                pauseBtn.textContent = 'Пауза';
+                animation.style.display = 'block';
+            } else {
+                mediaRecorder.pause();
+                pauseBtn.textContent = 'Возобновить';
+                animation.style.display = 'none';
+            }
+            isPaused = !isPaused;
+        });
+
+        // Стоп
+        stopBtn.addEventListener('click', () => {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                recordBtn.disabled = false;
+                pauseBtn.disabled = true;
+                stopBtn.disabled = true;
+                animation.style.display = 'none';
+            }
+        });
+
+        // Обработка аудио: транскрибация + коррекция (без сохранения)
+        async function processAudio(audioBlob) {
+            loading.style.display = 'block';
+            try {
+                // Шаг 1: Отправка на OpenAI Whisper
+                const formData = new FormData();
+                formData.append('file', audioBlob, 'audio.wav');
+                formData.append('model', 'whisper-1');
+                formData.append('language', 'ru');
+
+                const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${openaiApiKey}`
+                    },
+                    body: formData
+                });
+
+                if (!response.ok) throw new Error('Ошибка Whisper API: ' + response.statusText);
+                const data = await response.json();
+                let text = data.text;
+                originalText = text;
+
+                // Шаг 2: Коррекция с LanguageTool
+                const correctedText = await correctText(text);
+                transcription.value = correctedText;
+
+                // Шаг 3: НИЧЕГО НЕ СОХРАНЯЕМ — файлы исчезают после обработки
+                console.log('Транскрибация завершена (без сохранения файла)');
+
+            } catch (err) {
+                showError('Ошибка обработки: ' + err.message);
+            } finally {
+                loading.style.display = 'none';
+            }
+        }
+
+        // Коррекция текста с LanguageTool
+        async function correctText(text) {
+            try {
+                const response = await fetch('https://api.languagetool.org/v2/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        text: text,
+                        language: 'ru'
+                    })
+                });
+                const data = await response.json();
+                let corrected = text;
+                data.matches.forEach(match => {
+                    corrected = corrected.replace(match.context.text, match.replacements[0]?.value || match.context.text);
+                });
+                return corrected;
+            } catch (err) {
+                console.warn('Ошибка коррекции:', err);
+                return text;
+            }
+        }
+
+        // Вернуть оригинальный текст
+        resetBtn.addEventListener('click', () => {
+            transcription.value = originalText;
+        });
+
+        // Экспорт текста в файл
+        exportBtn.addEventListener('click', () => {
+            const blob = new Blob([transcription.value], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'transcription.txt';
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+    </script>
+</body>
+</html>
